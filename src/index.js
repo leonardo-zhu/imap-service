@@ -1,5 +1,6 @@
 require('dotenv').config();
 const { listenForNewEmails } = require('./imapClient');
+const { createServer } = require('./server');
 
 // Validate shared required env vars
 const requiredEnv = ['OPENCLAW_WEBHOOK_URL', 'OPENCLAW_HOOKS_TOKEN'];
@@ -44,3 +45,6 @@ accounts.forEach(account => {
     console.log(`  · [${account.label ?? account.user}] ${account.host}:${account.port}`);
     listenForNewEmails(account);
 });
+
+createServer();
+
