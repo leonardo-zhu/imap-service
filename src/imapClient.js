@@ -1,9 +1,11 @@
 const { ImapFlow } = require('imapflow');
 const simpleParser = require('mailparser').simpleParser;
+const logger = require('./logger');
 
 // Registry of active IMAP clients keyed by account label.
-// Used by the HTTP server to look up a connection for mark-as-read operations.
 const clientRegistry = new Map();
+// Track the last seen message count per account to prevent missing emails during reconnection gaps.
+const lastKnownCount = new Map();
 
 const createImapClient = (account) => {
     return new ImapFlow({
@@ -19,42 +21,62 @@ const createImapClient = (account) => {
     });
 };
 
-const pushToOpenClaw = async (emailData) => {
+/**
+ * Helper to fetch messages by sequence range and push to OpenClaw.
+ */
+const fetchAndPush = async (client, fromSeq, toSeq, label) => {
     try {
-        console.log(`🚀 [${emailData.account}] Pushing email [${emailData.subject}] to OpenClaw...`);
-        const response = await fetch(`${process.env.OPENCLAW_WEBHOOK_URL}/mail`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${process.env.OPENCLAW_HOOKS_TOKEN}`,
-            },
-            body: JSON.stringify(emailData),
-        });
+        for await (let message of client.fetch({ seq: `${fromSeq}:${toSeq}` }, { source: true })) {
+            if (message.source) {
+                const parsed = await simpleParser(message.source);
+                const emailData = {
+                    account: label,
+                    uid: message.uid,
+                    seq: message.seq,
+                    subject: parsed.subject,
+                    from: parsed.from?.text,
+                    date: parsed.date,
+                    text: parsed.text,
+                };
+                
+                logger.info(`Pushing email [${emailData.subject}] to OpenClaw...`, label, '🚀');
+                
+                const response = await fetch(`${process.env.OPENCLAW_WEBHOOK_URL}/mail`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${process.env.OPENCLAW_HOOKS_TOKEN}`,
+                    },
+                    body: JSON.stringify(emailData),
+                });
 
-        if (!response.ok) {
-            const errorText = await response.text();
-            console.error(`❌ [${emailData.account}] Webhook push failed with status: ${response.status}. Message: ${errorText}`);
-        } else {
-            console.log(`✅ [${emailData.account}] Webhook pushed successfully.`);
+                if (!response.ok) {
+                    try {
+                        const errorJson = await response.json();
+                        logger.error(`Webhook push failed (Status ${response.status}): ${errorJson.error}`, label);
+                    } catch (e) {
+                        logger.error(`Webhook push failed (Status ${response.status})`, label);
+                    }
+                } else {
+                    logger.success(`Webhook pushed successfully.`, label);
+                }
+            }
         }
     } catch (err) {
-        console.error(`❌ [${emailData.account}] Error pushing to webhook:`, err.message);
+        logger.error(`Error processing messages ${fromSeq}:${toSeq}: ${err.message}`, label);
     }
 };
 
 /**
- * Mark a message as read (\Seen) by its UID on a given account.
- * @param {string} label - The account label.
- * @param {number} uid - The message UID.
+ * Mark a message as read (\Seen) by its UID.
  */
 const markAsRead = async (label, uid) => {
     const client = clientRegistry.get(label);
     if (!client) {
         throw new Error(`No active IMAP connection found for account: ${label}`);
     }
-    // messageFlagsAdd handles exiting IDLE, applying the flag, and re-entering IDLE automatically.
     await client.messageFlagsAdd({ uid }, ['\\Seen'], { uid: true });
-    console.log(`📖 [${label}] Marked message UID ${uid} as read.`);
+    logger.info(`Marked message UID ${uid} as read.`, label, '📖');
 };
 
 const listenForNewEmails = async (account) => {
@@ -62,51 +84,50 @@ const listenForNewEmails = async (account) => {
     const client = createImapClient(account);
 
     client.on('error', err => {
-        console.error(`IMAP Error [${label}]:`, err);
+        logger.error(`IMAP Error: ${err.message}`, label);
     });
 
     client.on('close', () => {
         clientRegistry.delete(label);
-        console.log(`IMAP connection closed [${label}]. Reconnecting in 5 seconds...`);
+        logger.warn(`IMAP connection closed. Reconnecting in 5 seconds...`, label);
         setTimeout(() => listenForNewEmails(account), 5000);
     });
 
     try {
         await client.connect();
-        await client.getMailboxLock('INBOX');
+        
+        // Open the mailbox and get current status
+        const box = await client.mailboxOpen('INBOX');
+        const currentCount = box.exists;
 
-        // Register the connected client so markAsRead can reach it.
+        // Register for mark-as-read operations
         clientRegistry.set(label, client);
-        console.log(`📬 [${label}] Connected and listening for new emails...`);
+        logger.info(`Connected and listening for new emails...`, label, '📬');
 
+        // Check if any messages arrived while we were disconnected (only if we've been connected before)
+        if (lastKnownCount.has(label)) {
+            const prev = lastKnownCount.get(label);
+            if (currentCount > prev) {
+                logger.info(`Found ${currentCount - prev} missed emails. Syncing gap ${prev + 1} to ${currentCount}...`, label, '🔄');
+                await fetchAndPush(client, prev + 1, currentCount, label);
+            }
+        }
+        
+        // Update the known count
+        lastKnownCount.set(label, currentCount);
+
+        // Listen for real-time events
         client.on('exists', async data => {
             const { prevCount, count } = data;
             if (count > prevCount) {
-                console.log(`🔔 [${label}] New email arrived! (${count - prevCount} new)`);
-
-                try {
-                    for await (let message of client.fetch({ seq: `${prevCount + 1}:${count}` }, { source: true })) {
-                        if (message.source) {
-                            const parsed = await simpleParser(message.source);
-                            const emailData = {
-                                account: label,
-                                uid: message.uid,
-                                seq: message.seq,
-                                subject: parsed.subject,
-                                from: parsed.from?.text,
-                                date: parsed.date,
-                                text: parsed.text,
-                            };
-                            await pushToOpenClaw(emailData);
-                        }
-                    }
-                } catch (err) {
-                    console.error(`Error fetching new messages [${label}]:`, err);
-                }
+                logger.info(`New email arrived! (${count - prevCount} new)`, label, '🔔');
+                await fetchAndPush(client, prevCount + 1, count, label);
             }
+            // Always update lastKnownCount in sync with the mailbox state
+            lastKnownCount.set(label, count);
         });
     } catch (err) {
-        console.error(`Failed to connect [${label}]:`, err.message);
+        logger.error(`Failed to connect: ${err.message}`, label);
         setTimeout(() => listenForNewEmails(account), 5000);
     }
 };
