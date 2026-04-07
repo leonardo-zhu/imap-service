@@ -1,6 +1,10 @@
 const { ImapFlow } = require('imapflow');
 const simpleParser = require('mailparser').simpleParser;
 
+// Registry of active IMAP clients keyed by account label.
+// Used by the HTTP server to look up a connection for mark-as-read operations.
+const clientRegistry = new Map();
+
 const createImapClient = (account) => {
     return new ImapFlow({
         host: account.host,
@@ -37,6 +41,21 @@ const pushToOpenClaw = async (emailData) => {
     }
 };
 
+/**
+ * Mark a message as read (\Seen) by its UID on a given account.
+ * @param {string} label - The account label.
+ * @param {number} uid - The message UID.
+ */
+const markAsRead = async (label, uid) => {
+    const client = clientRegistry.get(label);
+    if (!client) {
+        throw new Error(`No active IMAP connection found for account: ${label}`);
+    }
+    // messageFlagsAdd handles exiting IDLE, applying the flag, and re-entering IDLE automatically.
+    await client.messageFlagsAdd({ uid }, ['\\Seen'], { uid: true });
+    console.log(`📖 [${label}] Marked message UID ${uid} as read.`);
+};
+
 const listenForNewEmails = async (account) => {
     const label = account.label ?? account.user;
     const client = createImapClient(account);
@@ -46,6 +65,7 @@ const listenForNewEmails = async (account) => {
     });
 
     client.on('close', () => {
+        clientRegistry.delete(label);
         console.log(`IMAP connection closed [${label}]. Reconnecting in 5 seconds...`);
         setTimeout(() => listenForNewEmails(account), 5000);
     });
@@ -53,6 +73,9 @@ const listenForNewEmails = async (account) => {
     try {
         await client.connect();
         await client.getMailboxLock('INBOX');
+
+        // Register the connected client so markAsRead can reach it.
+        clientRegistry.set(label, client);
         console.log(`📬 [${label}] Connected and listening for new emails...`);
 
         client.on('exists', async data => {
@@ -87,4 +110,4 @@ const listenForNewEmails = async (account) => {
     }
 };
 
-module.exports = { listenForNewEmails };
+module.exports = { listenForNewEmails, markAsRead };
