@@ -127,11 +127,9 @@ jobs:
           fi
           set +a
 
-          if pm2 describe "$DEPLOY_PM2_NAME" >/dev/null 2>&1; then
-            pm2 reload ecosystem.config.cjs --only "$DEPLOY_PM2_NAME" --update-env
-          else
-            pm2 start ecosystem.config.cjs --only "$DEPLOY_PM2_NAME" --update-env
-          fi
+          pm2 delete "$DEPLOY_PM2_NAME" 2>/dev/null || true
+          pm2 start ecosystem.config.cjs --only "$DEPLOY_PM2_NAME" --update-env
+          pm2 save
 
           rm -f "/tmp/$ARCHIVE_NAME"
           ls -1dt "$RELEASES_DIR"/* 2>/dev/null | tail -n +$((KEEP_RELEASES + 1)) | xargs -r rm -rf
