@@ -32,7 +32,8 @@ const pushToOpenClaw = async (emailData) => {
         });
 
         if (!response.ok) {
-            console.error(`❌ [${emailData.account}] Webhook push failed with status: ${response.status}`);
+            const errorText = await response.text();
+            console.error(`❌ [${emailData.account}] Webhook push failed with status: ${response.status}. Message: ${errorText}`);
         } else {
             console.log(`✅ [${emailData.account}] Webhook pushed successfully.`);
         }
