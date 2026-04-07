@@ -68,7 +68,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          : "${SSH_HOST:?missing DEPLOY_SSH_HOST}"
           : "${SSH_USER:?missing DEPLOY_SSH_USER}"
           : "${SSH_PRIVATE_KEY:?missing DEPLOY_SSH_PRIVATE_KEY}"
           : "${DEPLOY_PATH:?missing DEPLOY_PATH}"
