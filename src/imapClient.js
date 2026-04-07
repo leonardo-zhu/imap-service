@@ -1,99 +1,90 @@
 const { ImapFlow } = require('imapflow');
 const simpleParser = require('mailparser').simpleParser;
 
-const createImapClient = () => {
+const createImapClient = (account) => {
     return new ImapFlow({
-        host: process.env.IMAP_HOST || 'imap.qq.com',
-        port: parseInt(process.env.IMAP_PORT || '993', 10),
+        host: account.host,
+        port: account.port,
         secure: true,
         auth: {
-            user: process.env.IMAP_USER,
-            pass: process.env.IMAP_PASS
+            user: account.user,
+            pass: account.pass,
         },
         logger: false,
-        // Optional: QQ Mail occasionally drops connections, so keepalive configuration is good
-        clientInfo: { name: 'OpenClaw IMAP sync' }
+        clientInfo: { name: 'OpenClaw IMAP sync' },
     });
 };
 
 const pushToOpenClaw = async (emailData) => {
     try {
-        console.log(`🚀 Pushing email [${emailData.subject}] to OpenClaw...`);
+        console.log(`🚀 [${emailData.account}] Pushing email [${emailData.subject}] to OpenClaw...`);
         const response = await fetch(`${process.env.OPENCLAW_WEBHOOK_URL}/mail`, {
             method: 'POST',
-            headers: { 
+            headers: {
                 'Content-Type': 'application/json',
-                'Authorization': `Bearer ${process.env.OPENCLAW_HOOKS_TOKEN}`
+                'Authorization': `Bearer ${process.env.OPENCLAW_HOOKS_TOKEN}`,
             },
-            body: JSON.stringify(emailData)
+            body: JSON.stringify(emailData),
         });
-        
+
         if (!response.ok) {
-            console.error(`❌ Webhook pushed failed with status: ${response.status}`);
+            console.error(`❌ [${emailData.account}] Webhook push failed with status: ${response.status}`);
         } else {
-            console.log(`✅ Webhook pushed successfully.`);
+            console.log(`✅ [${emailData.account}] Webhook pushed successfully.`);
         }
     } catch (err) {
-        console.error('❌ Error pushing to webhook:', err.message);
+        console.error(`❌ [${emailData.account}] Error pushing to webhook:`, err.message);
     }
 };
 
-const listenForNewEmails = async () => {
-    const client = createImapClient();
-    
-    // Handle error events so the process doesn't crash entirely silently
+const listenForNewEmails = async (account) => {
+    const label = account.label ?? account.user;
+    const client = createImapClient(account);
+
     client.on('error', err => {
-        console.error('IMAP Error:', err);
+        console.error(`IMAP Error [${label}]:`, err);
     });
 
     client.on('close', () => {
-        console.log('IMAP Connection closed. Reconnecting in 5 seconds...');
-        setTimeout(listenForNewEmails, 5000); // Simple auto-reconnect
+        console.log(`IMAP connection closed [${label}]. Reconnecting in 5 seconds...`);
+        setTimeout(() => listenForNewEmails(account), 5000);
     });
 
     try {
         await client.connect();
-        // Keep the INBOX selected and listen for IDLE/events
-        let lock = await client.getMailboxLock('INBOX');
-        console.log('📬 Connected to IMAP and listening for new emails...');
+        await client.getMailboxLock('INBOX');
+        console.log(`📬 [${label}] Connected and listening for new emails...`);
 
-        // The "exists" event triggers when new messages arrive
         client.on('exists', async data => {
             const { prevCount, count } = data;
-            // new messages only
             if (count > prevCount) {
-                console.log(`🔔 New email arrived! (${count - prevCount} new)`);
-                
+                console.log(`🔔 [${label}] New email arrived! (${count - prevCount} new)`);
+
                 try {
-                    // Fetch using sequence numbers from prevCount+1 to new count
                     for await (let message of client.fetch({ seq: `${prevCount + 1}:${count}` }, { source: true })) {
                         if (message.source) {
                             const parsed = await simpleParser(message.source);
                             const emailData = {
+                                account: label,
                                 uid: message.uid,
                                 seq: message.seq,
                                 subject: parsed.subject,
                                 from: parsed.from?.text,
                                 date: parsed.date,
-                                text: parsed.text, 
+                                text: parsed.text,
                             };
-                            
-                            // Immediately push out to OpenClaw
                             await pushToOpenClaw(emailData);
                         }
                     }
                 } catch (err) {
-                    console.error('Error fetching new messages during IDLE:', err);
+                    console.error(`Error fetching new messages [${label}]:`, err);
                 }
             }
         });
-
     } catch (err) {
-        console.error('Failed to start listening to IMAP:', err.message);
-        setTimeout(listenForNewEmails, 5000); 
+        console.error(`Failed to connect [${label}]:`, err.message);
+        setTimeout(() => listenForNewEmails(account), 5000);
     }
 };
 
-module.exports = {
-    listenForNewEmails
-};
+module.exports = { listenForNewEmails };
