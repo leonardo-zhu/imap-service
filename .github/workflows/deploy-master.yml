@@ -1,0 +1,139 @@
+name: Deploy On Master
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-master
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Pack Release
+        env:
+          RELEASE_ID: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p .release/app
+          rsync -a ./ .release/app/ \
+            --exclude '.git' \
+            --exclude '.github' \
+            --exclude '.claude' \
+            --exclude '.env' \
+            --exclude '.env.*' \
+            --exclude 'node_modules' \
+            --exclude 'src' \
+            --exclude 'tests' \
+            --exclude '*.log'
+          tar -C .release -czf ".release/release-${RELEASE_ID}.tgz" app
+
+      - name: Deploy Built Artifact via SSH
+        env:
+          SSH_HOST: ${{ secrets.DEPLOY_SSH_HOST }}
+          SSH_PORT: ${{ secrets.DEPLOY_SSH_PORT }}
+          SSH_USER: ${{ secrets.DEPLOY_SSH_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          DEPLOY_PM2_NAME: ${{ secrets.DEPLOY_PM2_NAME }}
+          DEPLOY_ENV_FILE: ${{ secrets.DEPLOY_ENV_FILE }}
+          DEPLOY_SERVICE_ENV_FILE: ${{ secrets.DEPLOY_SERVICE_ENV_FILE }}
+          RELEASE_ID: ${{ github.sha }}-${{ github.run_attempt }}
+          KEEP_RELEASES: ${{ secrets.DEPLOY_KEEP_RELEASES }}
+        run: |
+          set -euo pipefail
+
+          : "${SSH_HOST:?missing DEPLOY_SSH_HOST}"
+          : "${SSH_USER:?missing DEPLOY_SSH_USER}"
+          : "${SSH_PRIVATE_KEY:?missing DEPLOY_SSH_PRIVATE_KEY}"
+          : "${DEPLOY_PATH:?missing DEPLOY_PATH}"
+
+          SSH_PORT="${SSH_PORT:-22}"
+          KEEP_RELEASES="${KEEP_RELEASES:-3}"
+          DEPLOY_PM2_NAME="${DEPLOY_PM2_NAME:-imap-service}"
+          DEPLOY_ENV_FILE="${DEPLOY_ENV_FILE:-/opt/projects/.secrets/global.env}"
+          DEPLOY_SERVICE_ENV_FILE="${DEPLOY_SERVICE_ENV_FILE:-}"
+          ARCHIVE_NAME="release-${RELEASE_ID}.tgz"
+          ARCHIVE_PATH=".release/${ARCHIVE_NAME}"
+          DEPLOY_PATH_B64="$(printf "%s" "$DEPLOY_PATH" | base64 | tr -d '\n')"
+          DEPLOY_PM2_NAME_B64="$(printf "%s" "$DEPLOY_PM2_NAME" | base64 | tr -d '\n')"
+          DEPLOY_ENV_FILE_B64="$(printf "%s" "$DEPLOY_ENV_FILE" | base64 | tr -d '\n')"
+          DEPLOY_SERVICE_ENV_FILE_B64="$(printf "%s" "$DEPLOY_SERVICE_ENV_FILE" | base64 | tr -d '\n')"
+          RELEASE_ID_B64="$(printf "%s" "$RELEASE_ID" | base64 | tr -d '\n')"
+          KEEP_RELEASES_B64="$(printf "%s" "$KEEP_RELEASES" | base64 | tr -d '\n')"
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf "%s" "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+
+          scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P "$SSH_PORT" \
+            "$ARCHIVE_PATH" "$SSH_USER@$SSH_HOST:/tmp/$ARCHIVE_NAME"
+
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
+            "DEPLOY_PATH_B64='$DEPLOY_PATH_B64' DEPLOY_PM2_NAME_B64='$DEPLOY_PM2_NAME_B64' DEPLOY_ENV_FILE_B64='$DEPLOY_ENV_FILE_B64' DEPLOY_SERVICE_ENV_FILE_B64='$DEPLOY_SERVICE_ENV_FILE_B64' RELEASE_ID_B64='$RELEASE_ID_B64' KEEP_RELEASES_B64='$KEEP_RELEASES_B64' bash -s" << 'EOF'
+          set -euo pipefail
+
+          DEPLOY_PATH="$(printf "%s" "$DEPLOY_PATH_B64" | base64 -d)"
+          DEPLOY_PM2_NAME="$(printf "%s" "$DEPLOY_PM2_NAME_B64" | base64 -d)"
+          DEPLOY_ENV_FILE="$(printf "%s" "$DEPLOY_ENV_FILE_B64" | base64 -d)"
+          DEPLOY_SERVICE_ENV_FILE="$(printf "%s" "$DEPLOY_SERVICE_ENV_FILE_B64" | base64 -d)"
+          RELEASE_ID="$(printf "%s" "$RELEASE_ID_B64" | base64 -d)"
+          KEEP_RELEASES="$(printf "%s" "$KEEP_RELEASES_B64" | base64 -d)"
+          ARCHIVE_NAME="release-${RELEASE_ID}.tgz"
+          RELEASES_DIR="$DEPLOY_PATH/releases"
+          RELEASE_DIR="$RELEASES_DIR/$RELEASE_ID"
+          CURRENT_LINK="$DEPLOY_PATH/current"
+
+          mkdir -p "$RELEASES_DIR"
+          mkdir -p "$RELEASE_DIR"
+
+          tar -xzf "/tmp/$ARCHIVE_NAME" -C "$RELEASE_DIR" --strip-components=1
+
+          ln -sfn "$RELEASE_DIR" "$CURRENT_LINK"
+          cd "$CURRENT_LINK"
+
+          # Load shared and service-specific env files into process environment for PM2.
+          set -a
+          if [ -f "$DEPLOY_ENV_FILE" ]; then
+            . "$DEPLOY_ENV_FILE"
+          fi
+          if [ -n "$DEPLOY_SERVICE_ENV_FILE" ] && [ -f "$DEPLOY_SERVICE_ENV_FILE" ]; then
+            . "$DEPLOY_SERVICE_ENV_FILE"
+          fi
+          set +a
+
+          if pm2 describe "$DEPLOY_PM2_NAME" >/dev/null 2>&1; then
+            pm2 reload ecosystem.config.cjs --only "$DEPLOY_PM2_NAME" --update-env
+          else
+            pm2 start ecosystem.config.cjs --only "$DEPLOY_PM2_NAME" --update-env
+          fi
+
+          rm -f "/tmp/$ARCHIVE_NAME"
+          ls -1dt "$RELEASES_DIR"/* 2>/dev/null | tail -n +$((KEEP_RELEASES + 1)) | xargs -r rm -rf
+          EOF
