@@ -37,7 +37,7 @@ jobs:
 
       - name: Pack Release
         env:
-          RELEASE_ID: ${{ github.sha }}
+          RELEASE_ID: ${{ github.sha }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
           mkdir -p .release/app
