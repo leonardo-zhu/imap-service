@@ -1,18 +1,19 @@
 const http = require('http');
 const { markAsRead } = require('./imapClient');
+const logger = require('./logger');
 
 const PORT = parseInt(process.env.HTTP_PORT || '2525', 10);
 const TOKEN = process.env.OPENCLAW_HOOKS_TOKEN;
 
 /**
  * Minimal HTTP server exposing internal control endpoints.
- * All requests must carry the same Bearer token used for outgoing webhooks.
  */
 const createServer = () => {
     const server = http.createServer(async (req, res) => {
         // Auth check
         const auth = req.headers['authorization'] ?? '';
         if (auth !== `Bearer ${TOKEN}`) {
+            logger.error('Unauthorized access attempt');
             res.writeHead(401, { 'Content-Type': 'application/json' });
             return res.end(JSON.stringify({ error: 'Unauthorized' }));
         }
@@ -34,7 +35,7 @@ const createServer = () => {
                     res.writeHead(200, { 'Content-Type': 'application/json' });
                     res.end(JSON.stringify({ ok: true, uid, account }));
                 } catch (err) {
-                    console.error('❌ mark-as-read failed:', err.message);
+                    logger.error(`mark-as-read failed: ${err.message}`);
                     res.writeHead(500, { 'Content-Type': 'application/json' });
                     res.end(JSON.stringify({ error: err.message }));
                 }
@@ -47,10 +48,11 @@ const createServer = () => {
     });
 
     server.listen(PORT, () => {
-        console.log(`🌐 HTTP server listening on port ${PORT}`);
+        logger.info(`Mail minimal HTTP server listening on port ${PORT}`, '', '🌐');
     });
 
     return server;
 };
 
 module.exports = { createServer };
+
