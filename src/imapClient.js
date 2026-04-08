@@ -89,9 +89,10 @@ const listenForNewEmails = async (account) => {
 
     const stopHeartbeat = () => {
         if (heartbeatTimer) {
-            clearInterval(heartbeatTimer);
+            clearTimeout(heartbeatTimer);
             heartbeatTimer = null;
         }
+        nextExistsSource = null;
     };
 
     client.on('error', err => {
@@ -143,15 +144,35 @@ const listenForNewEmails = async (account) => {
         });
 
         // Heartbeat reconciliation: some servers may miss real-time EXISTS updates.
-        heartbeatTimer = setInterval(async () => {
+        const heartbeatLoop = async () => {
             try {
-                // Mark the next EXISTS update as heartbeat-sourced (status() may emit exists when messages count changes).
+                // Mark the next EXISTS update as heartbeat-sourced.
+                // This is time-bounded so we don't mislabel a later realtime EXISTS if no update happens now.
                 nextExistsSource = 'heartbeat';
-                await client.status('INBOX', { messages: true });
+                const clearTagTimer = setTimeout(() => {
+                    if (nextExistsSource === 'heartbeat') {
+                        nextExistsSource = null;
+                    }
+                }, 5000);
+
+                try {
+                    await client.status('INBOX', { messages: true });
+                } finally {
+                    clearTimeout(clearTagTimer);
+                    if (nextExistsSource === 'heartbeat') {
+                        nextExistsSource = null;
+                    }
+                }
             } catch (err) {
                 logger.warn(`Heartbeat status check failed: ${err.message}`, label);
+                nextExistsSource = null;
+            } finally {
+                // Schedule next run only after this one finishes to avoid overlap.
+                heartbeatTimer = setTimeout(heartbeatLoop, 60 * 1000);
             }
-        }, 60 * 1000);
+        };
+
+        heartbeatTimer = setTimeout(heartbeatLoop, 60 * 1000);
     } catch (err) {
         stopHeartbeat();
         logger.error(`Failed to connect: ${err.message}`, label);
