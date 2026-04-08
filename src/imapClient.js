@@ -18,6 +18,8 @@ const createImapClient = (account) => {
         },
         logger: false,
         clientInfo: { name: 'OpenClaw IMAP sync' },
+        // Periodically break/restart IDLE to reduce stale long-lived connections.
+        maxIdleTime: 10 * 60 * 1000,
     });
 };
 
@@ -82,12 +84,22 @@ const markAsRead = async (label, uid) => {
 const listenForNewEmails = async (account) => {
     const label = account.label ?? account.user;
     const client = createImapClient(account);
+    let heartbeatTimer = null;
+    let nextExistsSource = null;
+
+    const stopHeartbeat = () => {
+        if (heartbeatTimer) {
+            clearInterval(heartbeatTimer);
+            heartbeatTimer = null;
+        }
+    };
 
     client.on('error', err => {
         logger.error(`IMAP Error: ${err.message}`, label);
     });
 
     client.on('close', () => {
+        stopHeartbeat();
         clientRegistry.delete(label);
         logger.warn(`IMAP connection closed. Reconnecting in 5 seconds...`, label);
         setTimeout(() => listenForNewEmails(account), 5000);
@@ -120,13 +132,28 @@ const listenForNewEmails = async (account) => {
         client.on('exists', async data => {
             const { prevCount, count } = data;
             if (count > prevCount) {
-                logger.info(`New email arrived! (${count - prevCount} new)`, label, '🔔');
+                const source = nextExistsSource || 'realtime';
+                nextExistsSource = null;
+                const icon = source === 'heartbeat' ? '💓' : '🔔';
+                logger.info(`New email arrived! (${count - prevCount} new, source: ${source})`, label, icon);
                 await fetchAndPush(client, prevCount + 1, count, label);
             }
             // Always update lastKnownCount in sync with the mailbox state
             lastKnownCount.set(label, count);
         });
+
+        // Heartbeat reconciliation: some servers may miss real-time EXISTS updates.
+        heartbeatTimer = setInterval(async () => {
+            try {
+                // Mark the next EXISTS update as heartbeat-sourced (status() may emit exists when messages count changes).
+                nextExistsSource = 'heartbeat';
+                await client.status('INBOX', { messages: true });
+            } catch (err) {
+                logger.warn(`Heartbeat status check failed: ${err.message}`, label);
+            }
+        }, 60 * 1000);
     } catch (err) {
+        stopHeartbeat();
         logger.error(`Failed to connect: ${err.message}`, label);
         setTimeout(() => listenForNewEmails(account), 5000);
     }
