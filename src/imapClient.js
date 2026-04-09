@@ -86,8 +86,10 @@ const listenForNewEmails = async (account) => {
     const client = createImapClient(account);
     let heartbeatTimer = null;
     let nextExistsSource = null;
+    let heartbeatStopped = false;
 
     const stopHeartbeat = () => {
+        heartbeatStopped = true;
         if (heartbeatTimer) {
             clearTimeout(heartbeatTimer);
             heartbeatTimer = null;
@@ -108,6 +110,7 @@ const listenForNewEmails = async (account) => {
 
     try {
         await client.connect();
+        heartbeatStopped = false;
         
         // Open the mailbox and get current status
         const box = await client.mailboxOpen('INBOX');
@@ -146,6 +149,11 @@ const listenForNewEmails = async (account) => {
         // Heartbeat reconciliation: some servers may miss real-time EXISTS updates.
         const heartbeatLoop = async () => {
             try {
+                // If the connection is not usable (e.g., closed), stop scheduling heartbeats to avoid log spam.
+                if (heartbeatStopped || !client.usable) {
+                    return;
+                }
+
                 // Mark the next EXISTS update as heartbeat-sourced.
                 // This is time-bounded so we don't mislabel a later realtime EXISTS if no update happens now.
                 nextExistsSource = 'heartbeat';
@@ -164,11 +172,16 @@ const listenForNewEmails = async (account) => {
                     }
                 }
             } catch (err) {
-                logger.warn(`Heartbeat status check failed: ${err.message}`, label);
+                // "Connection not available" is expected if the socket has been closed; suppress repeated warnings.
+                if (err.message !== 'Connection not available') {
+                    logger.warn(`Heartbeat status check failed: ${err.message}`, label);
+                }
                 nextExistsSource = null;
             } finally {
                 // Schedule next run only after this one finishes to avoid overlap.
-                heartbeatTimer = setTimeout(heartbeatLoop, 60 * 1000);
+                if (!heartbeatStopped && client.usable) {
+                    heartbeatTimer = setTimeout(heartbeatLoop, 60 * 1000);
+                }
             }
         };
 
