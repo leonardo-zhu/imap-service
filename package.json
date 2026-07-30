@@ -15,6 +15,7 @@
   "packageManager": "pnpm@10.33.0",
   "dependencies": {
     "dotenv": "^17.4.1",
+    "googleapis": "^173.0.0",
     "imapflow": "^1.2.18",
     "mailparser": "^3.9.6"
   },
