@@ -37,7 +37,7 @@ const createGmailClient = (account) => {
     const oAuth2Client = new google.auth.OAuth2(
         account.clientId,
         account.clientSecret,
-        account.redirectUri || 'https://developers.google.com/oauthplayground'
+        account.redirectUri
     );
     oAuth2Client.setCredentials({ refresh_token: account.refreshToken });
 
