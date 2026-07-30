@@ -67,3 +67,6 @@ jobs:
           docker compose pull
           docker compose up -d --remove-orphans
 
+          # Automatically clean up dangling old images left after updates (<none>:<none>)
+          docker image prune -f
+
