@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - master
-      - improve/imap-heartbeat-exists-source
   workflow_dispatch:
 
 concurrency:
