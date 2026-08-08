@@ -1,9 +1,28 @@
 const { google } = require('googleapis');
 const logger = require('./logger');
 
-// Registry of active Gmail clients and configurations keyed by account label.
+// Registry of active Gmail clients and configurations keyed by account label and user email.
 // Account entry: { label, user, clientId, clientSecret, refreshToken, topicName, auth, gmail, lastHistoryId }
 const gmailRegistry = new Map();
+
+/**
+ * Get Gmail registry entry by account label or user email (case-insensitive).
+ */
+const getGmailReg = (accountKey) => {
+    if (!accountKey) return null;
+    if (gmailRegistry.has(accountKey)) return gmailRegistry.get(accountKey);
+    const lowerKey = accountKey.toLowerCase();
+    if (gmailRegistry.has(lowerKey)) return gmailRegistry.get(lowerKey);
+    for (const entry of gmailRegistry.values()) {
+        if (
+            (entry.label && entry.label.toLowerCase() === lowerKey) ||
+            (entry.user && entry.user.toLowerCase() === lowerKey)
+        ) {
+            return entry;
+        }
+    }
+    return null;
+};
 
 /**
  * Extract case-insensitive header value from Gmail message payload headers.
@@ -50,7 +69,7 @@ const createGmailClient = (account) => {
  */
 const renewWatch = async (account) => {
     const label = account.label ?? account.user;
-    const reg = gmailRegistry.get(label);
+    const reg = getGmailReg(label);
     if (!reg) return;
 
     try {
@@ -89,7 +108,14 @@ const listenForGmailAccounts = async (accounts = []) => {
             lastHistoryId: null,
         };
 
-        gmailRegistry.set(label, reg);
+        if (label) {
+            gmailRegistry.set(label, reg);
+            gmailRegistry.set(label.toLowerCase(), reg);
+        }
+        if (account.user) {
+            gmailRegistry.set(account.user, reg);
+            gmailRegistry.set(account.user.toLowerCase(), reg);
+        }
 
         // Initial watch registration
         await renewWatch(account);
@@ -230,10 +256,10 @@ const handlePubSubPush = async (reqBody) => {
 /**
  * Mark a Gmail message as read (remove UNREAD label) by message ID.
  */
-const markGmailAsRead = async (label, uid) => {
-    const reg = gmailRegistry.get(label);
+const markGmailAsRead = async (accountKey, uid) => {
+    const reg = getGmailReg(accountKey);
     if (!reg) {
-        throw new Error(`No active Gmail account found for label: ${label}`);
+        throw new Error(`No active Gmail account found for account: ${accountKey}`);
     }
 
     await reg.gmail.users.messages.modify({
@@ -244,14 +270,14 @@ const markGmailAsRead = async (label, uid) => {
         },
     });
 
-    logger.info(`Marked Gmail message ID ${uid} as read.`, label, '📖');
+    logger.info(`Marked Gmail message ID ${uid} as read.`, reg.label, '📖');
 };
 
 /**
- * Check if an account label belongs to a registered Gmail account.
+ * Check if an account label or user email belongs to a registered Gmail account.
  */
-const isGmailAccount = (label) => {
-    return gmailRegistry.has(label);
+const isGmailAccount = (accountKey) => {
+    return getGmailReg(accountKey) !== null;
 };
 
 module.exports = {

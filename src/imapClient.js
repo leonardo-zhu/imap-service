@@ -2,10 +2,21 @@ const { ImapFlow } = require('imapflow');
 const simpleParser = require('mailparser').simpleParser;
 const logger = require('./logger');
 
-// Registry of active IMAP clients keyed by account label.
+// Registry of active IMAP clients keyed by account label and user email.
 const clientRegistry = new Map();
 // Track the last seen message count per account to prevent missing emails during reconnection gaps.
 const lastKnownCount = new Map();
+
+/**
+ * Get active IMAP client by account label or user email (case-insensitive).
+ */
+const getImapClient = (accountKey) => {
+    if (!accountKey) return null;
+    if (clientRegistry.has(accountKey)) return clientRegistry.get(accountKey);
+    const lowerKey = accountKey.toLowerCase();
+    if (clientRegistry.has(lowerKey)) return clientRegistry.get(lowerKey);
+    return null;
+};
 
 const createImapClient = (account) => {
     return new ImapFlow({
@@ -72,13 +83,13 @@ const fetchAndPush = async (client, fromSeq, toSeq, label) => {
 /**
  * Mark a message as read (\Seen) by its UID.
  */
-const markAsRead = async (label, uid) => {
-    const client = clientRegistry.get(label);
+const markAsRead = async (accountKey, uid) => {
+    const client = getImapClient(accountKey);
     if (!client) {
-        throw new Error(`No active IMAP connection found for account: ${label}`);
+        throw new Error(`No active IMAP connection found for account: ${accountKey}`);
     }
     await client.messageFlagsAdd({ uid }, ['\\Seen'], { uid: true });
-    logger.info(`Marked message UID ${uid} as read.`, label, '📖');
+    logger.info(`Marked message UID ${uid} as read.`, accountKey, '📖');
 };
 
 const listenForNewEmails = async (account) => {
@@ -103,7 +114,14 @@ const listenForNewEmails = async (account) => {
 
     client.on('close', () => {
         stopHeartbeat();
-        clientRegistry.delete(label);
+        if (label) {
+            clientRegistry.delete(label);
+            clientRegistry.delete(label.toLowerCase());
+        }
+        if (account.user) {
+            clientRegistry.delete(account.user);
+            clientRegistry.delete(account.user.toLowerCase());
+        }
         logger.warn(`IMAP connection closed. Reconnecting in 5 seconds...`, label);
         setTimeout(() => listenForNewEmails(account), 5000);
     });
@@ -117,7 +135,14 @@ const listenForNewEmails = async (account) => {
         const currentCount = box.exists;
 
         // Register for mark-as-read operations
-        clientRegistry.set(label, client);
+        if (label) {
+            clientRegistry.set(label, client);
+            clientRegistry.set(label.toLowerCase(), client);
+        }
+        if (account.user) {
+            clientRegistry.set(account.user, client);
+            clientRegistry.set(account.user.toLowerCase(), client);
+        }
         logger.info(`Connected and listening for new emails...`, label, '📬');
 
         // Check if any messages arrived while we were disconnected (only if we've been connected before)
