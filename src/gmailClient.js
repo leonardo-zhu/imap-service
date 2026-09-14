@@ -254,23 +254,38 @@ const handlePubSubPush = async (reqBody) => {
 };
 
 /**
- * Mark a Gmail message as read (remove UNREAD label) by message ID.
+ * Mark a Gmail message as read (remove UNREAD label) by message ID with retry logic.
  */
-const markGmailAsRead = async (accountKey, uid) => {
+const markGmailAsRead = async (accountKey, uid, maxRetries = 3) => {
     const reg = getGmailReg(accountKey);
     if (!reg) {
         throw new Error(`No active Gmail account found for account: ${accountKey}`);
     }
 
-    await reg.gmail.users.messages.modify({
-        userId: 'me',
-        id: uid,
-        requestBody: {
-            removeLabelIds: ['UNREAD'],
-        },
-    });
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            await reg.gmail.users.messages.modify({
+                userId: 'me',
+                id: uid,
+                requestBody: {
+                    removeLabelIds: ['UNREAD'],
+                },
+            });
 
-    logger.info(`Marked Gmail message ID ${uid} as read.`, reg.label, '📖');
+            logger.info(`Marked Gmail message ID ${uid} as read.`, reg.label, '📖');
+            return;
+        } catch (err) {
+            const isLastAttempt = attempt === maxRetries;
+            if (isLastAttempt) {
+                throw err;
+            }
+            logger.warn(
+                `Failed to mark Gmail as read (attempt ${attempt}/${maxRetries}): ${err.message}. Retrying in ${attempt}s...`,
+                reg.label
+            );
+            await new Promise(resolve => setTimeout(resolve, attempt * 1000));
+        }
+    }
 };
 
 /**
