@@ -6,6 +6,36 @@ const logger = require('./logger');
 const clientRegistry = new Map();
 // Track the last seen message count per account to prevent missing emails during reconnection gaps.
 const lastKnownCount = new Map();
+// Current reconnect delay per account; doubles on consecutive failures and resets after a successful connect.
+const reconnectDelay = new Map();
+// Recently pushed messages per account ("uidValidity:uid"), so a duplicate connection or gap sync never pushes the same mail twice.
+const pushedMessages = new Map();
+
+const RECONNECT_BASE_MS = 5000;
+const RECONNECT_MAX_MS = 5 * 60 * 1000;
+const MAX_TRACKED_MESSAGES = 5000;
+
+/**
+ * Claim a message for pushing. Returns a key, or null if it was already pushed.
+ */
+const claimMessage = (label, client, uid) => {
+    const key = `${client.mailbox?.uidValidity ?? ''}:${uid}`;
+    let seen = pushedMessages.get(label);
+    if (!seen) {
+        seen = new Set();
+        pushedMessages.set(label, seen);
+    }
+    if (seen.has(key)) return null;
+    seen.add(key);
+    if (seen.size > MAX_TRACKED_MESSAGES) {
+        seen.delete(seen.values().next().value);
+    }
+    return key;
+};
+
+const releaseMessage = (label, key) => {
+    pushedMessages.get(label)?.delete(key);
+};
 
 /**
  * Get active IMAP client by account label or user email (case-insensitive).
@@ -41,37 +71,48 @@ const fetchAndPush = async (client, fromSeq, toSeq, label) => {
     try {
         for await (let message of client.fetch({ seq: `${fromSeq}:${toSeq}` }, { source: true })) {
             if (message.source) {
-                const parsed = await simpleParser(message.source);
-                const emailData = {
-                    account: label,
-                    uid: message.uid,
-                    seq: message.seq,
-                    subject: parsed.subject,
-                    from: parsed.from?.text,
-                    date: parsed.date,
-                    text: parsed.text,
-                };
-                
-                logger.info(`Pushing email [${emailData.subject}] to OpenClaw...`, label, '🚀');
-                
-                const response = await fetch(`${process.env.OPENCLAW_WEBHOOK_URL}/mail`, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Authorization': `Bearer ${process.env.OPENCLAW_HOOKS_TOKEN}`,
-                    },
-                    body: JSON.stringify(emailData),
-                });
+                const claimKey = claimMessage(label, client, message.uid);
+                if (!claimKey) {
+                    logger.warn(`Skipping UID ${message.uid}: already pushed.`, label);
+                    continue;
+                }
+                try {
+                    const parsed = await simpleParser(message.source);
+                    const emailData = {
+                        account: label,
+                        uid: message.uid,
+                        seq: message.seq,
+                        subject: parsed.subject,
+                        from: parsed.from?.text,
+                        date: parsed.date,
+                        text: parsed.text,
+                    };
 
-                if (!response.ok) {
-                    try {
-                        const errorJson = await response.json();
-                        logger.error(`Webhook push failed (Status ${response.status}): ${errorJson.error}`, label);
-                    } catch (e) {
-                        logger.error(`Webhook push failed (Status ${response.status})`, label);
+                    logger.info(`Pushing email [${emailData.subject}] to OpenClaw...`, label, '🚀');
+
+                    const response = await fetch(`${process.env.OPENCLAW_WEBHOOK_URL}/mail`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'Authorization': `Bearer ${process.env.OPENCLAW_HOOKS_TOKEN}`,
+                        },
+                        body: JSON.stringify(emailData),
+                    });
+
+                    if (!response.ok) {
+                        releaseMessage(label, claimKey);
+                        try {
+                            const errorJson = await response.json();
+                            logger.error(`Webhook push failed (Status ${response.status}): ${errorJson.error}`, label);
+                        } catch (e) {
+                            logger.error(`Webhook push failed (Status ${response.status})`, label);
+                        }
+                    } else {
+                        logger.success(`Webhook pushed successfully.`, label);
                     }
-                } else {
-                    logger.success(`Webhook pushed successfully.`, label);
+                } catch (err) {
+                    releaseMessage(label, claimKey);
+                    throw err;
                 }
             }
         }
@@ -108,31 +149,46 @@ const listenForNewEmails = async (account) => {
         nextExistsSource = null;
     };
 
+    // Each attempt schedules exactly one successor. A failed connect() makes imapflow emit 'close' as well as
+    // reject, so both paths funnel through here; otherwise every failure would fork another reconnect chain.
+    let reconnectScheduled = false;
+    const scheduleReconnect = () => {
+        if (reconnectScheduled) return;
+        reconnectScheduled = true;
+        const delay = reconnectDelay.get(label) ?? RECONNECT_BASE_MS;
+        reconnectDelay.set(label, Math.min(delay * 2, RECONNECT_MAX_MS));
+        logger.warn(`Reconnecting in ${Math.round(delay / 1000)} seconds...`, label);
+        setTimeout(() => listenForNewEmails(account), delay);
+    };
+
+    // Only drop registry entries that still point at this client, so a stale close never unregisters its replacement.
+    const unregisterClient = key => {
+        if (!key) return;
+        for (const k of [key, key.toLowerCase()]) {
+            if (clientRegistry.get(k) === client) clientRegistry.delete(k);
+        }
+    };
+
     client.on('error', err => {
         logger.error(`IMAP Error: ${err.message}`, label);
     });
 
     client.on('close', () => {
         stopHeartbeat();
-        if (label) {
-            clientRegistry.delete(label);
-            clientRegistry.delete(label.toLowerCase());
-        }
-        if (account.user) {
-            clientRegistry.delete(account.user);
-            clientRegistry.delete(account.user.toLowerCase());
-        }
-        logger.warn(`IMAP connection closed. Reconnecting in 5 seconds...`, label);
-        setTimeout(() => listenForNewEmails(account), 5000);
+        unregisterClient(label);
+        unregisterClient(account.user);
+        logger.warn(`IMAP connection closed.`, label);
+        scheduleReconnect();
     });
 
     try {
         await client.connect();
         heartbeatStopped = false;
-        
+
         // Open the mailbox and get current status
         const box = await client.mailboxOpen('INBOX');
         const currentCount = box.exists;
+        reconnectDelay.delete(label);
 
         // Register for mark-as-read operations
         if (label) {
@@ -214,7 +270,9 @@ const listenForNewEmails = async (account) => {
     } catch (err) {
         stopHeartbeat();
         logger.error(`Failed to connect: ${err.message}`, label);
-        setTimeout(() => listenForNewEmails(account), 5000);
+        // Make sure a half-open connection (e.g. connected but mailboxOpen failed) doesn't linger next to the retry.
+        client.close();
+        scheduleReconnect();
     }
 };
 
