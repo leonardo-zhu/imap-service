@@ -64,9 +64,20 @@ const createServer = () => {
             let body = '';
             req.on('data', chunk => { body += chunk; });
             req.on('end', async () => {
+                let uid;
+                let account;
                 try {
-                    const { uid, account } = JSON.parse(body);
+                    ({ uid, account } = JSON.parse(body) ?? {});
+                } catch (err) {
+                    const reason = body.trim() === '' ? 'empty request body' : err.message;
+                    logger.warn(`mark-read rejected (400): ${reason}`);
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    return res.end(JSON.stringify({
+                        error: `Request body must be JSON like {"uid": "...", "account": "..."} (${reason}).`,
+                    }));
+                }
 
+                try {
                     if (!uid || !account) {
                         res.writeHead(400, { 'Content-Type': 'application/json' });
                         return res.end(JSON.stringify({ error: '`uid` and `account` are required.' }));
